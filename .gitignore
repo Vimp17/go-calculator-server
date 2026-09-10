@@ -1,0 +1,25 @@
+# Скомпилированные бинарники
+server
+server.exe
+generator
+generator.exe
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+
+# Артефакты сборки библиотек
+rust_lib/target/
+.gotmp/
+.tmp/
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE и ОС
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
