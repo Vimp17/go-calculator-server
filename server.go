@@ -20,17 +20,38 @@ import (
 	"unsafe"
 )
 
+/*
+#cgo LDFLAGS: -ldl
+#include <stdlib.h>
+#include <dlfcn.h>
+#include <stdint.h>
+
+typedef int64_t (*calc_func)(int64_t, int64_t);
+
+void* load_lib(const char* path) {
+    return dlopen(path, RTLD_NOW | RTLD_LOCAL);
+}
+
+void* get_sym(void* handle, const char* name) {
+    return dlsym(handle, name);
+}
+
+void close_lib(void* handle) {
+    dlclose(handle);
+}
+
+// C-обёртка для вызова указателя на функцию
+int64_t call_calc(void* func, int64_t a, int64_t b) {
+    return ((calc_func)func)(a, b);
+}
+*/
+import "C"
+
 var (
-	modkernel32        = syscall.NewLazyDLL("kernel32.dll")
-	procLoadLibrary    = modkernel32.NewProc("LoadLibraryA")
-	procGetProcAddress = modkernel32.NewProc("GetProcAddress")
-	procFreeLibrary    = modkernel32.NewProc("FreeLibrary")
-
-	addFunc func(a, b int64) int64
-	subFunc func(a, b int64) int64
-
-	cHandle uintptr
-	rHandle uintptr
+	addFuncPtr unsafe.Pointer
+	subFuncPtr unsafe.Pointer
+	cHandle    unsafe.Pointer
+	rHandle    unsafe.Pointer
 
 	sumValue int64
 	subValue int64
@@ -47,33 +68,35 @@ var (
 )
 
 func loadLibraries(cPath, rustPath string) error {
-	cPathBytes := append([]byte(cPath), 0)
-	handle, _, err := procLoadLibrary.Call(uintptr(unsafe.Pointer(&cPathBytes[0])))
-	if handle == 0 {
-		return fmt.Errorf("failed to load C library %q: %w", cPath, err)
-	}
-	cHandle = handle
+	cPathC := C.CString(cPath)
+	defer C.free(unsafe.Pointer(cPathC))
 
-	addSym, _, err := procGetProcAddress.Call(handle, uintptr(unsafe.Pointer(syscall.StringBytePtr("add"))))
-	if addSym == 0 {
-		return fmt.Errorf("symbol 'add' not found: %w", err)
+	cHandle = C.load_lib(cPathC)
+	if cHandle == nil {
+		return fmt.Errorf("failed to load C library: %s", cPath)
 	}
 
-	addFunc = *(*func(int64, int64) int64)(unsafe.Pointer(&addSym))
-
-	rustPathBytes := append([]byte(rustPath), 0)
-	handle, _, err = procLoadLibrary.Call(uintptr(unsafe.Pointer(&rustPathBytes[0])))
-	if handle == 0 {
-		return fmt.Errorf("failed to load Rust library %q: %w", rustPath, err)
-	}
-	rHandle = handle
-
-	subSym, _, err := procGetProcAddress.Call(handle, uintptr(unsafe.Pointer(syscall.StringBytePtr("sub"))))
-	if subSym == 0 {
-		return fmt.Errorf("symbol 'sub' not found: %w", err)
+	addSymName := C.CString("add")
+	defer C.free(unsafe.Pointer(addSymName))
+	addFuncPtr = C.get_sym(cHandle, addSymName)
+	if addFuncPtr == nil {
+		return fmt.Errorf("symbol 'add' not found in C library")
 	}
 
-	subFunc = *(*func(int64, int64) int64)(unsafe.Pointer(&subSym))
+	rustPathC := C.CString(rustPath)
+	defer C.free(unsafe.Pointer(rustPathC))
+
+	rHandle = C.load_lib(rustPathC)
+	if rHandle == nil {
+		return fmt.Errorf("failed to load Rust library: %s", rustPath)
+	}
+
+	subSymName := C.CString("sub")
+	defer C.free(unsafe.Pointer(subSymName))
+	subFuncPtr = C.get_sym(rHandle, subSymName)
+	if subFuncPtr == nil {
+		return fmt.Errorf("symbol 'sub' not found in Rust library")
+	}
 
 	return nil
 }
@@ -96,10 +119,12 @@ func calcHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Lock-free CAS для C функции
 	for {
 		oldSum := atomic.LoadInt64(&sumValue)
 		startC := time.Now().UnixNano()
-		newSum := addFunc(oldSum, num)
+		// Вызов через C-обёртку
+		newSum := int64(C.call_calc(addFuncPtr, C.int64_t(oldSum), C.int64_t(num)))
 		endC := time.Now().UnixNano()
 
 		if atomic.CompareAndSwapInt64(&sumValue, oldSum, newSum) {
@@ -110,10 +135,12 @@ func calcHandler(w http.ResponseWriter, r *http.Request) {
 		runtime.Gosched()
 	}
 
+	// Lock-free CAS для Rust функции
 	for {
 		oldSub := atomic.LoadInt64(&subValue)
 		startRust := time.Now().UnixNano()
-		newSub := subFunc(oldSub, num)
+		// Вызов через C-обёртку
+		newSub := int64(C.call_calc(subFuncPtr, C.int64_t(oldSub), C.int64_t(num)))
 		endRust := time.Now().UnixNano()
 
 		if atomic.CompareAndSwapInt64(&subValue, oldSub, newSub) {
@@ -213,15 +240,8 @@ func main() {
 	if err := loadLibraries(*cLib, *rustLib); err != nil {
 		log.Fatalf("Failed to load native libraries: %v\nDid you run build.sh first?", err)
 	}
-
-	defer func() {
-		if cHandle != 0 {
-			procFreeLibrary.Call(cHandle)
-		}
-		if rHandle != 0 {
-			procFreeLibrary.Call(rHandle)
-		}
-	}()
+	defer C.close_lib(cHandle)
+	defer C.close_lib(rHandle)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/calc", calcHandler)
